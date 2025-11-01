@@ -1,71 +1,129 @@
+// ===============================
+// Secure Authentication Controller
+// ===============================
+require("dotenv").config();
 const db = require("../models");
 const User = db.user;
 
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
+const { validationResult } = require("express-validator");
+const logger = require("../utils/logger"); // (Use Winston or console fallback)
 
-exports.register = async (req, res) => {
+// -------------------------------
+// REGISTER USER
+// -------------------------------
+exports.register = async (req, res, next) => {
   try {
-    const givenUsername = req.body.username;
-    const givenMail = req.body.email;
-    const givenPass = req.body.password;
-    if (givenUsername && givenMail && givenPass) {
-      const user = new User({
-        username: givenUsername,
-        email: givenMail,
-        password: bcrypt.hashSync(givenPass, 8),
-      });
-      await user.save();
-      res.send({ message: "User registered successfully!" });
-    } else {
-      res.status(500).send({ message: "Missing info given" });
+    // Validate request data
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ message: "Invalid input", errors: errors.array() });
     }
+
+    const { username, email, password } = req.body;
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(409).json({ message: "Email already registered" });
+    }
+
+    // Strong password hashing
+    const salt = await bcrypt.genSalt(12);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    // Create new user
+    const newUser = new User({
+      username: username.trim(),
+      email: email.toLowerCase().trim(),
+      password: hashedPassword,
+      role: "user",
+    });
+
+    await newUser.save();
+
+    logger.info(`New user registered: ${email}`);
+    return res.status(201).json({ message: "User registered successfully" });
   } catch (err) {
-    next(err);
+    logger.error(`Registration Error: ${err.message}`);
+    return res.status(500).json({ message: "Internal Server Error" });
   }
 };
 
-exports.getUserData = async (req, res) => {
-  try {
-    const user = await User.findById(req.userId).exec();
-    res.send({ username: user.username });
-  } catch (err) {
-    next(err);
-  }
-};
-
+// -------------------------------
+// LOGIN USER
+// -------------------------------
 exports.login = async (req, res, next) => {
   try {
-    const user = await User.findOne({ email: req.body.email }).exec();
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ message: "Invalid input", errors: errors.array() });
+    }
+
+    const { email, password } = req.body;
+
+    // Find user
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user) {
-      return res.status(401).send({
-        accessToken: null,
-        message: "Invalid email and password combination.",
-      });
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    const passwordIsValid = bcrypt.compareSync(
-      req.body.password,
-      user.password
-    );
+    // Validate password
+    const passwordIsValid = await bcrypt.compare(password, user.password);
     if (!passwordIsValid) {
-      return res.status(401).send({
-        accessToken: null,
-        message: "Invalid email and password combination.",
-      });
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    const token = jwt.sign({ id: user.id }, process.env.SECRET_TOKEN, {
-      expiresIn: "24H", // 24 hours
+    // Generate JWT
+    const token = jwt.sign(
+      { id: user._id, email: user.email, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: "1h", algorithm: "HS256" }
+    );
+
+    // Send token in HttpOnly cookie
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+      maxAge: 60 * 60 * 1000, // 1 hour
     });
 
-    res.status(200).send({
-      id: user._id,
-      username: user.username,
-      email: user.email,
-      accessToken: token,
+    logger.info(`User logged in: ${email}`);
+    return res.status(200).json({
+      message: "Login successful",
+      user: { id: user._id, username: user.username, email: user.email, role: user.role },
     });
   } catch (err) {
-    next(err);
+    logger.error(`Login Error: ${err.message}`);
+    return res.status(500).json({ message: "Internal Server Error" });
+  }
+};
+
+// -------------------------------
+// GET USER DATA (Protected Route)
+// -------------------------------
+exports.getUserData = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.userId).select("-password").exec();
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.status(200).json({ user });
+  } catch (err) {
+    logger.error(`GetUserData Error: ${err.message}`);
+    return res.status(500).json({ message: "Internal Server Error" });
+  }
+};
+
+// -------------------------------
+// LOGOUT USER
+// -------------------------------
+exports.logout = async (req, res) => {
+  try {
+    res.clearCookie("token");
+    return res.status(200).json({ message: "Logout successful" });
+  } catch (err) {
+    logger.error(`Logout Error: ${err.message}`);
+    return res.status(500).json({ message: "Internal Server Error" });
   }
 };
